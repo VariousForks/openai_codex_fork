@@ -135,9 +135,9 @@ flowchart TD
     U[User Input] --> RL[AgentLoop.run()]
   end
   RL --> Req[OpenAI /responses.create]
-  Req -- stream --> Evt[Streaming Events]
-  Evt -- message --> Display[Display to User]
-  Evt -- function_call --> FC[handleFunctionCall]
+  Req --|stream|--> Evt[Streaming Events]
+  Evt --|message|--> Display[Display to User]
+  Evt --|function_call|--> FC[handleFunctionCall]
   FC --> Exec[execute shell/container]
   Exec --> RespOut[function_call_output]
   RespOut --> RL
