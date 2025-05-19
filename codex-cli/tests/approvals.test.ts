@@ -11,7 +11,13 @@ describe("canAutoApprove()", () => {
 
   const writeablePaths: Array<string> = [];
   const check = (command: ReadonlyArray<string>): SafetyAssessment =>
-    canAutoApprove(command, "suggest", writeablePaths, env);
+    canAutoApprove(
+      command,
+      /* workdir */ undefined,
+      "suggest",
+      writeablePaths,
+      env,
+    );
 
   test("simple safe commands", () => {
     expect(check(["ls"])).toEqual({
@@ -23,6 +29,12 @@ describe("canAutoApprove()", () => {
     expect(check(["cat", "file.txt"])).toEqual({
       type: "auto-approve",
       reason: "View file contents",
+      group: "Reading files",
+      runInSandbox: false,
+    });
+    expect(check(["nl", "-ba", "README.md"])).toEqual({
+      type: "auto-approve",
+      reason: "View file with line numbers",
       group: "Reading files",
       runInSandbox: false,
     });
@@ -139,6 +151,43 @@ describe("canAutoApprove()", () => {
       check(["find", ".", "-fprintf", "/root/suid.txt", "%#m %u %p\n"]),
     ).toEqual({
       type: "ask-user",
+    });
+  });
+
+  test("sed", () => {
+    // `sed` used to read lines from a file.
+    expect(check(["sed", "-n", "1,200p", "filename.txt"])).toEqual({
+      type: "auto-approve",
+      reason: "Sed print subset",
+      group: "Reading files",
+      runInSandbox: false,
+    });
+    // Bad quoting! The model is doing the wrong thing here, so this should not
+    // be auto-approved.
+    expect(check(["sed", "-n", "'1,200p'", "filename.txt"])).toEqual({
+      type: "ask-user",
+    });
+    // Extra arg: here we are extra conservative, we do not auto-approve.
+    expect(check(["sed", "-n", "1,200p", "file1.txt", "file2.txt"])).toEqual({
+      type: "ask-user",
+    });
+
+    // `sed` used to read lines from a file with a shell command.
+    expect(check(["bash", "-lc", "sed -n '1,200p' filename.txt"])).toEqual({
+      type: "auto-approve",
+      reason: "Sed print subset",
+      group: "Reading files",
+      runInSandbox: false,
+    });
+
+    // Pipe the output of `nl` to `sed`.
+    expect(
+      check(["bash", "-lc", "nl -ba README.md | sed -n '1,200p'"]),
+    ).toEqual({
+      type: "auto-approve",
+      reason: "View file with line numbers",
+      group: "Reading files",
+      runInSandbox: false,
     });
   });
 });

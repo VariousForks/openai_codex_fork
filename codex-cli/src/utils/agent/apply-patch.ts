@@ -211,9 +211,46 @@ class Parser {
       }
       if (defStr.trim()) {
         let found = false;
-        if (!fileLines.slice(0, index).some((s) => s === defStr)) {
+        // ------------------------------------------------------------------
+        // Equality helpers using the canonicalisation from find_context_core.
+        // (We duplicate a minimal version here because the scope is local.)
+        // ------------------------------------------------------------------
+        const canonLocal = (s: string): string =>
+          s.normalize("NFC").replace(
+            /./gu,
+            (c) =>
+              (
+                ({
+                  "-": "-",
+                  "\u2010": "-",
+                  "\u2011": "-",
+                  "\u2012": "-",
+                  "\u2013": "-",
+                  "\u2014": "-",
+                  "\u2212": "-",
+                  "\u0022": '"',
+                  "\u201C": '"',
+                  "\u201D": '"',
+                  "\u201E": '"',
+                  "\u00AB": '"',
+                  "\u00BB": '"',
+                  "\u0027": "'",
+                  "\u2018": "'",
+                  "\u2019": "'",
+                  "\u201B": "'",
+                  "\u00A0": " ",
+                  "\u202F": " ",
+                }) as Record<string, string>
+              )[c] ?? c,
+          );
+
+        if (
+          !fileLines
+            .slice(0, index)
+            .some((s) => canonLocal(s) === canonLocal(defStr))
+        ) {
           for (let i = index; i < fileLines.length; i++) {
-            if (fileLines[i] === defStr) {
+            if (canonLocal(fileLines[i]!) === canonLocal(defStr)) {
               index = i + 1;
               found = true;
               break;
@@ -222,10 +259,14 @@ class Parser {
         }
         if (
           !found &&
-          !fileLines.slice(0, index).some((s) => s.trim() === defStr.trim())
+          !fileLines
+            .slice(0, index)
+            .some((s) => canonLocal(s.trim()) === canonLocal(defStr.trim()))
         ) {
           for (let i = index; i < fileLines.length; i++) {
-            if (fileLines[i]!.trim() === defStr.trim()) {
+            if (
+              canonLocal(fileLines[i]!.trim()) === canonLocal(defStr.trim())
+            ) {
               index = i + 1;
               this.fuzz += 1;
               found = true;
@@ -293,34 +334,98 @@ function find_context_core(
   context: Array<string>,
   start: number,
 ): [number, number] {
+  // ---------------------------------------------------------------------------
+  // Helpers – Unicode punctuation normalisation
+  // ---------------------------------------------------------------------------
+
+  /*
+   * The patch-matching algorithm originally required **exact** string equality
+   * for non-whitespace characters.  That breaks when the file on disk contains
+   * visually identical but different Unicode code-points (e.g. “EN DASH” vs
+   * ASCII "-"), because models almost always emit the ASCII variant.  To make
+   * apply_patch resilient we canonicalise a handful of common punctuation
+   * look-alikes before doing comparisons.
+   *
+   * We purposefully keep the mapping *small* – only characters that routinely
+   * appear in source files and are highly unlikely to introduce ambiguity are
+   * included.  Each entry is written using the corresponding Unicode escape so
+   * that the file remains ASCII-only even after transpilation.
+   */
+
+  const PUNCT_EQUIV: Record<string, string> = {
+    // Hyphen / dash variants --------------------------------------------------
+    /* U+002D HYPHEN-MINUS */ "-": "-",
+    /* U+2010 HYPHEN */ "\u2010": "-",
+    /* U+2011 NO-BREAK HYPHEN */ "\u2011": "-",
+    /* U+2012 FIGURE DASH */ "\u2012": "-",
+    /* U+2013 EN DASH */ "\u2013": "-",
+    /* U+2014 EM DASH */ "\u2014": "-",
+    /* U+2212 MINUS SIGN */ "\u2212": "-",
+
+    // Double quotes -----------------------------------------------------------
+    /* U+0022 QUOTATION MARK */ "\u0022": '"',
+    /* U+201C LEFT DOUBLE QUOTATION MARK */ "\u201C": '"',
+    /* U+201D RIGHT DOUBLE QUOTATION MARK */ "\u201D": '"',
+    /* U+201E DOUBLE LOW-9 QUOTATION MARK */ "\u201E": '"',
+    /* U+00AB LEFT-POINTING DOUBLE ANGLE QUOTATION MARK */ "\u00AB": '"',
+    /* U+00BB RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK */ "\u00BB": '"',
+
+    // Single quotes -----------------------------------------------------------
+    /* U+0027 APOSTROPHE */ "\u0027": "'",
+    /* U+2018 LEFT SINGLE QUOTATION MARK */ "\u2018": "'",
+    /* U+2019 RIGHT SINGLE QUOTATION MARK */ "\u2019": "'",
+    /* U+201B SINGLE HIGH-REVERSED-9 QUOTATION MARK */ "\u201B": "'",
+    // Spaces ------------------------------------------------------------------
+    /* U+00A0 NO-BREAK SPACE */ "\u00A0": " ",
+    /* U+202F NARROW NO-BREAK SPACE */ "\u202F": " ",
+  };
+
+  const canon = (s: string): string =>
+    s
+      // Canonical Unicode composition first
+      .normalize("NFC")
+      // Replace punctuation look-alikes
+      .replace(/./gu, (c) => PUNCT_EQUIV[c] ?? c);
   if (context.length === 0) {
     return [start, 0];
   }
+  // Pass 1 – exact equality after canonicalisation ---------------------------
+  const canonicalContext = canon(context.join("\n"));
   for (let i = start; i < lines.length; i++) {
-    if (lines.slice(i, i + context.length).join("\n") === context.join("\n")) {
+    const segment = canon(lines.slice(i, i + context.length).join("\n"));
+    if (segment === canonicalContext) {
       return [i, 0];
     }
   }
+
+  // Pass 2 – ignore trailing whitespace -------------------------------------
   for (let i = start; i < lines.length; i++) {
-    if (
+    const segment = canon(
       lines
         .slice(i, i + context.length)
         .map((s) => s.trimEnd())
-        .join("\n") === context.map((s) => s.trimEnd()).join("\n")
-    ) {
+        .join("\n"),
+    );
+    const ctx = canon(context.map((s) => s.trimEnd()).join("\n"));
+    if (segment === ctx) {
       return [i, 1];
     }
   }
+
+  // Pass 3 – ignore all surrounding whitespace ------------------------------
   for (let i = start; i < lines.length; i++) {
-    if (
+    const segment = canon(
       lines
         .slice(i, i + context.length)
         .map((s) => s.trim())
-        .join("\n") === context.map((s) => s.trim()).join("\n")
-    ) {
+        .join("\n"),
+    );
+    const ctx = canon(context.map((s) => s.trim()).join("\n"));
+    if (segment === ctx) {
       return [i, 100];
     }
   }
+
   return [-1, 0];
 }
 
@@ -445,7 +550,15 @@ export function text_to_patch(
     !(lines[0] ?? "").startsWith(PATCH_PREFIX.trim()) ||
     lines[lines.length - 1] !== PATCH_SUFFIX.trim()
   ) {
-    throw new DiffError("Invalid patch text");
+    let reason = "Invalid patch text: ";
+    if (lines.length < 2) {
+      reason += "Patch text must have at least two lines.";
+    } else if (!(lines[0] ?? "").startsWith(PATCH_PREFIX.trim())) {
+      reason += "Patch text must start with the correct patch prefix.";
+    } else if (lines[lines.length - 1] !== PATCH_SUFFIX.trim()) {
+      reason += "Patch text must end with the correct patch suffix.";
+    }
+    throw new DiffError(reason);
   }
   const parser = new Parser(orig, lines);
   parser.index = 1;
@@ -657,3 +770,46 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     }
   });
 }
+
+export const applyPatchToolInstructions = `
+To edit files, ALWAYS use the \`shell\` tool with \`apply_patch\` CLI.  \`apply_patch\` effectively allows you to execute a diff/patch against a file, but the format of the diff specification is unique to this task, so pay careful attention to these instructions. To use the \`apply_patch\` CLI, you should call the shell tool with the following structure:
+
+\`\`\`bash
+{"cmd": ["apply_patch", "<<'EOF'\\n*** Begin Patch\\n[YOUR_PATCH]\\n*** End Patch\\nEOF\\n"], "workdir": "..."}
+\`\`\`
+
+Where [YOUR_PATCH] is the actual content of your patch, specified in the following V4A diff format.
+
+*** [ACTION] File: [path/to/file] -> ACTION can be one of Add, Update, or Delete.
+For each snippet of code that needs to be changed, repeat the following:
+[context_before] -> See below for further instructions on context.
+- [old_code] -> Precede the old code with a minus sign.
++ [new_code] -> Precede the new, replacement code with a plus sign.
+[context_after] -> See below for further instructions on context.
+
+For instructions on [context_before] and [context_after]:
+- By default, show 3 lines of code immediately above and 3 lines immediately below each change. If a change is within 3 lines of a previous change, do NOT duplicate the first change’s [context_after] lines in the second change’s [context_before] lines.
+- If 3 lines of context is insufficient to uniquely identify the snippet of code within the file, use the @@ operator to indicate the class or function to which the snippet belongs. For instance, we might have:
+@@ class BaseClass
+[3 lines of pre-context]
+- [old_code]
++ [new_code]
+[3 lines of post-context]
+
+- If a code block is repeated so many times in a class or function such that even a single \`@@\` statement and 3 lines of context cannot uniquely identify the snippet of code, you can use multiple \`@@\` statements to jump to the right context. For instance:
+
+@@ class BaseClass
+@@ 	def method():
+[3 lines of pre-context]
+- [old_code]
++ [new_code]
+[3 lines of post-context]
+
+Note, then, that we do not use line numbers in this diff format, as the context is enough to uniquely identify code. An example of a message that you might pass as "input" to this function, in order to apply a patch, is shown below.
+
+\`\`\`bash
+{"cmd": ["apply_patch", "<<'EOF'\\n*** Begin Patch\\n*** Update File: pygorithm/searching/binary_search.py\\n@@ class BaseClass\\n@@     def search():\\n-        pass\\n+        raise NotImplementedError()\\n@@ class Subclass\\n@@     def search():\\n-        pass\\n+        raise NotImplementedError()\\n*** End Patch\\nEOF\\n"], "workdir": "..."}
+\`\`\`
+
+File references can only be relative, NEVER ABSOLUTE. After the apply_patch command is run, it will always say "Done!", regardless of whether the patch was successfully applied or not. However, you can determine if there are issue and errors by looking at any warnings or logging lines printed BEFORE the "Done!" is output.
+`;

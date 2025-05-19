@@ -8,41 +8,48 @@
 ---
 
 <details>
-<summary><strong>Table&nbsp;of&nbsp;Contents</strong></summary>
+<summary><strong>Table of contents</strong></summary>
 
 <!-- Begin ToC -->
 
-- [Experimental Technology Disclaimer](#experimental-technology-disclaimer)
+- [Experimental technology disclaimer](#experimental-technology-disclaimer)
 - [Quickstart](#quickstart)
 - [Why Codex?](#why-codex)
-- [Security Model & Permissions](#security-model--permissions)
+- [Security model & permissions](#security-model--permissions)
   - [Platform sandboxing details](#platform-sandboxing-details)
-- [System Requirements](#system-requirements)
-- [CLI Reference](#cli-reference)
-- [Memory & Project Docs](#memory--project-docs)
+- [System requirements](#system-requirements)
+- [CLI reference](#cli-reference)
+- [Memory & project docs](#memory--project-docs)
 - [Non-interactive / CI mode](#non-interactive--ci-mode)
-- [Tracing / Verbose Logging](#tracing--verbose-logging)
+- [Tracing / verbose logging](#tracing--verbose-logging)
 - [Recipes](#recipes)
 - [Installation](#installation)
-- [Configuration](#configuration)
+- [Configuration guide](#configuration-guide)
+  - [Basic configuration parameters](#basic-configuration-parameters)
+  - [Custom AI provider configuration](#custom-ai-provider-configuration)
+  - [History configuration](#history-configuration)
+  - [Configuration examples](#configuration-examples)
+  - [Full configuration example](#full-configuration-example)
+  - [Custom instructions](#custom-instructions)
+  - [Environment variables setup](#environment-variables-setup)
 - [FAQ](#faq)
-- [Zero Data Retention (ZDR) Organization Limitation](#zero-data-retention-zdr-organization-limitation)
-- [Funding Opportunity](#funding-opportunity)
+- [Zero data retention (ZDR) usage](#zero-data-retention-zdr-usage)
+- [Codex open source fund](#codex-open-source-fund)
 - [Contributing](#contributing)
   - [Development workflow](#development-workflow)
-  - [Git Hooks with Husky](#git-hooks-with-husky)
+  - [Git hooks with Husky](#git-hooks-with-husky)
   - [Debugging](#debugging)
   - [Writing high-impact code changes](#writing-high-impact-code-changes)
   - [Opening a pull request](#opening-a-pull-request)
   - [Review process](#review-process)
   - [Community values](#community-values)
   - [Getting help](#getting-help)
-  - [Contributor License Agreement (CLA)](#contributor-license-agreement-cla)
+  - [Contributor license agreement (CLA)](#contributor-license-agreement-cla)
     - [Quick fixes](#quick-fixes)
   - [Releasing `codex`](#releasing-codex)
-  - [Alternative Build Options](#alternative-build-options)
-    - [Nix Flake Development](#nix-flake-development)
-- [Security & Responsible AI](#security--responsible-ai)
+  - [Alternative build options](#alternative-build-options)
+    - [Nix flake development](#nix-flake-development)
+- [Security & responsible AI](#security--responsible-ai)
 - [License](#license)
 
 <!-- End ToC -->
@@ -51,7 +58,7 @@
 
 ---
 
-## Experimental Technology Disclaimer
+## Experimental technology disclaimer
 
 Codex CLI is an experimental project under active development. It is not yet stable, may contain bugs, incomplete features, or undergo breaking changes. We're building it in the open with the community and welcome:
 
@@ -91,17 +98,26 @@ export OPENAI_API_KEY="your-api-key-here"
 >
 > - openai (default)
 > - openrouter
+> - azure
 > - gemini
 > - ollama
 > - mistral
 > - deepseek
 > - xai
 > - groq
+> - arceeai
+> - any other provider that is compatible with the OpenAI API
 >
 > If you use a provider other than OpenAI, you will need to set the API key for the provider in the config file or in the environment variable as:
 >
 > ```shell
 > export <provider>_API_KEY="your-api-key-here"
+> ```
+>
+> If you use a provider not listed above, you must also set the base URL for the provider:
+>
+> ```shell
+> export <provider>_BASE_URL="https://your-provider-api-base-url"
 > ```
 
 </details>
@@ -144,7 +160,7 @@ And it's **fully open-source** so you can see and contribute to how it develops!
 
 ---
 
-## Security Model & Permissions
+## Security model & permissions
 
 Codex lets you decide _how much autonomy_ the agent receives and auto-approval policy via the
 `--approval-mode` flag (or the interactive onboarding prompt):
@@ -184,7 +200,7 @@ The hardening mechanism Codex uses depends on your OS:
 
 ---
 
-## System Requirements
+## System requirements
 
 | Requirement                 | Details                                                         |
 | --------------------------- | --------------------------------------------------------------- |
@@ -197,7 +213,7 @@ The hardening mechanism Codex uses depends on your OS:
 
 ---
 
-## CLI Reference
+## CLI reference
 
 | Command                              | Purpose                             | Example                              |
 | ------------------------------------ | ----------------------------------- | ------------------------------------ |
@@ -210,15 +226,15 @@ Key flags: `--model/-m`, `--approval-mode/-a`, `--quiet/-q`, and `--notify`.
 
 ---
 
-## Memory & Project Docs
+## Memory & project docs
 
-Codex merges Markdown instructions in this order:
+You can give Codex extra instructions and guidance using `AGENTS.md` files. Codex looks for `AGENTS.md` files in the following places, and merges them top-down:
 
-1. `~/.codex/instructions.md` - personal global guidance
-2. `codex.md` at repo root - shared project notes
-3. `codex.md` in cwd - sub-package specifics
+1. `~/.codex/AGENTS.md` - personal global guidance
+2. `AGENTS.md` at repo root - shared project notes
+3. `AGENTS.md` in the current working directory - sub-folder/feature specifics
 
-Disable with `--no-project-doc` or `CODEX_DISABLE_PROJECT_DOC=1`.
+Disable loading of these files with `--no-project-doc` or the environment variable `CODEX_DISABLE_PROJECT_DOC=1`.
 
 ---
 
@@ -236,7 +252,7 @@ Run Codex head-less in pipelines. Example GitHub Action step:
 
 Set `CODEX_QUIET_MODE=1` to silence interactive UI noise.
 
-## Tracing / Verbose Logging
+## Tracing / verbose logging
 
 Setting the environment variable `DEBUG=true` prints full API request and response details:
 
@@ -294,6 +310,9 @@ corepack enable
 pnpm install
 pnpm build
 
+# Linux-only: download prebuilt sandboxing binaries (requires gh and zstd).
+./scripts/install_native_deps.sh
+
 # Get the usage and the options
 node ./dist/cli.js --help
 
@@ -308,20 +327,53 @@ pnpm link
 
 ---
 
-## Configuration
+## Configuration guide
 
-Codex looks for config files in **`~/.codex/`** (either YAML or JSON format).
+Codex configuration files can be placed in the `~/.codex/` directory, supporting both YAML and JSON formats.
+
+### Basic configuration parameters
+
+| Parameter           | Type    | Default    | Description                      | Available Options                                                                              |
+| ------------------- | ------- | ---------- | -------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `model`             | string  | `o4-mini`  | AI model to use                  | Any model name supporting OpenAI API                                                           |
+| `approvalMode`      | string  | `suggest`  | AI assistant's permission mode   | `suggest` (suggestions only)<br>`auto-edit` (automatic edits)<br>`full-auto` (fully automatic) |
+| `fullAutoErrorMode` | string  | `ask-user` | Error handling in full-auto mode | `ask-user` (prompt for user input)<br>`ignore-and-continue` (ignore and proceed)               |
+| `notify`            | boolean | `true`     | Enable desktop notifications     | `true`/`false`                                                                                 |
+
+### Custom AI provider configuration
+
+In the `providers` object, you can configure multiple AI service providers. Each provider requires the following parameters:
+
+| Parameter | Type   | Description                             | Example                       |
+| --------- | ------ | --------------------------------------- | ----------------------------- |
+| `name`    | string | Display name of the provider            | `"OpenAI"`                    |
+| `baseURL` | string | API service URL                         | `"https://api.openai.com/v1"` |
+| `envKey`  | string | Environment variable name (for API key) | `"OPENAI_API_KEY"`            |
+
+### History configuration
+
+In the `history` object, you can configure conversation history settings:
+
+| Parameter           | Type    | Description                                            | Example Value |
+| ------------------- | ------- | ------------------------------------------------------ | ------------- |
+| `maxSize`           | number  | Maximum number of history entries to save              | `1000`        |
+| `saveHistory`       | boolean | Whether to save history                                | `true`        |
+| `sensitivePatterns` | array   | Patterns of sensitive information to filter in history | `[]`          |
+
+### Configuration examples
+
+1. YAML format (save as `~/.codex/config.yaml`):
 
 ```yaml
-# ~/.codex/config.yaml
-model: o4-mini # Default model
-approvalMode: suggest # or auto-edit, full-auto
-fullAutoErrorMode: ask-user # or ignore-and-continue
-notify: true # Enable desktop notifications for responses
+model: o4-mini
+approvalMode: suggest
+fullAutoErrorMode: ask-user
+notify: true
 ```
 
+2. JSON format (save as `~/.codex/config.json`):
+
 ```json
-// ~/.codex/config.json
 {
   "model": "o4-mini",
   "approvalMode": "suggest",
@@ -330,12 +382,99 @@ notify: true # Enable desktop notifications for responses
 }
 ```
 
-You can also define custom instructions:
+### Full configuration example
 
-```yaml
-# ~/.codex/instructions.md
+Below is a comprehensive example of `config.json` with multiple custom providers:
+
+```json
+{
+  "model": "o4-mini",
+  "provider": "openai",
+  "providers": {
+    "openai": {
+      "name": "OpenAI",
+      "baseURL": "https://api.openai.com/v1",
+      "envKey": "OPENAI_API_KEY"
+    },
+    "azure": {
+      "name": "AzureOpenAI",
+      "baseURL": "https://YOUR_PROJECT_NAME.openai.azure.com/openai",
+      "envKey": "AZURE_OPENAI_API_KEY"
+    },
+    "openrouter": {
+      "name": "OpenRouter",
+      "baseURL": "https://openrouter.ai/api/v1",
+      "envKey": "OPENROUTER_API_KEY"
+    },
+    "gemini": {
+      "name": "Gemini",
+      "baseURL": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "envKey": "GEMINI_API_KEY"
+    },
+    "ollama": {
+      "name": "Ollama",
+      "baseURL": "http://localhost:11434/v1",
+      "envKey": "OLLAMA_API_KEY"
+    },
+    "mistral": {
+      "name": "Mistral",
+      "baseURL": "https://api.mistral.ai/v1",
+      "envKey": "MISTRAL_API_KEY"
+    },
+    "deepseek": {
+      "name": "DeepSeek",
+      "baseURL": "https://api.deepseek.com",
+      "envKey": "DEEPSEEK_API_KEY"
+    },
+    "xai": {
+      "name": "xAI",
+      "baseURL": "https://api.x.ai/v1",
+      "envKey": "XAI_API_KEY"
+    },
+    "groq": {
+      "name": "Groq",
+      "baseURL": "https://api.groq.com/openai/v1",
+      "envKey": "GROQ_API_KEY"
+    },
+    "arceeai": {
+      "name": "ArceeAI",
+      "baseURL": "https://conductor.arcee.ai/v1",
+      "envKey": "ARCEEAI_API_KEY"
+    }
+  },
+  "history": {
+    "maxSize": 1000,
+    "saveHistory": true,
+    "sensitivePatterns": []
+  }
+}
+```
+
+### Custom instructions
+
+You can create a `~/.codex/AGENTS.md` file to define custom guidance for the agent:
+
+```markdown
 - Always respond with emojis
-- Only use git commands if I explicitly mention you should
+- Only use git commands when explicitly requested
+```
+
+### Environment variables setup
+
+For each AI provider, you need to set the corresponding API key in your environment variables. For example:
+
+```bash
+# OpenAI
+export OPENAI_API_KEY="your-api-key-here"
+
+# Azure OpenAI
+export AZURE_OPENAI_API_KEY="your-azure-api-key-here"
+export AZURE_OPENAI_API_VERSION="2025-03-01-preview" (Optional)
+
+# OpenRouter
+export OPENROUTER_API_KEY="your-openrouter-key-here"
+
+# Similarly for other providers
 ```
 
 ---
@@ -377,34 +516,23 @@ Not directly. It requires [Windows Subsystem for Linux (WSL2)](https://learn.mic
 
 ---
 
-## Zero Data Retention (ZDR) Organization Limitation
+## Zero data retention (ZDR) usage
 
-> **Note:** Codex CLI does **not** currently support OpenAI organizations with [Zero Data Retention (ZDR)](https://platform.openai.com/docs/guides/your-data#zero-data-retention) enabled.
-
-If your OpenAI organization has Zero Data Retention enabled, you may encounter errors such as:
+Codex CLI **does** support OpenAI organizations with [Zero Data Retention (ZDR)](https://platform.openai.com/docs/guides/your-data#zero-data-retention) enabled. If your OpenAI organization has Zero Data Retention enabled and you still encounter errors such as:
 
 ```
 OpenAI rejected the request. Error details: Status: 400, Code: unsupported_parameter, Type: invalid_request_error, Message: 400 Previous response cannot be used for this organization due to Zero Data Retention.
 ```
 
-**Why?**
-
-- Codex CLI relies on the Responses API with `store:true` to enable internal reasoning steps.
-- As noted in the [docs](https://platform.openai.com/docs/guides/your-data#responses-api), the Responses API requires a 30-day retention period by default, or when the store parameter is set to true.
-- ZDR organizations cannot use `store:true`, so requests will fail.
-
-**What can I do?**
-
-- If you are part of a ZDR organization, Codex CLI will not work until support is added.
-- We are tracking this limitation and will update the documentation once support becomes available.
+You may need to upgrade to a more recent version with: `npm i -g @openai/codex@latest`
 
 ---
 
-## Funding Opportunity
+## Codex open source fund
 
 We're excited to launch a **$1 million initiative** supporting open source projects that use Codex CLI and other OpenAI models.
 
-- Grants are awarded in **$25,000** API credit increments.
+- Grants are awarded up to **$25,000** API credits.
 - Applications are reviewed **on a rolling basis**.
 
 **Interested? [Apply here](https://openai.com/form/codex-open-source-fund/).**
@@ -425,7 +553,7 @@ More broadly we welcome contributions - whether you are opening your very first 
 - We use **Vitest** for unit tests, **ESLint** + **Prettier** for style, and **TypeScript** for type-checking.
 - Before pushing, run the full test/type/lint suite:
 
-### Git Hooks with Husky
+### Git hooks with Husky
 
 This project uses [Husky](https://typicode.github.io/husky/) to enforce code quality checks:
 
@@ -499,7 +627,7 @@ If you run into problems setting up the project, would like feedback on an idea,
 
 Together we can make Codex CLI an incredible tool. **Happy hacking!** :rocket:
 
-### Contributor License Agreement (CLA)
+### Contributor license agreement (CLA)
 
 All contributors **must** accept the CLA. The process is lightweight:
 
@@ -524,29 +652,42 @@ The **DCO check** blocks merges until every commit in the PR carries the footer 
 
 ### Releasing `codex`
 
-To publish a new version of the CLI, run the release scripts defined in `codex-cli/package.json`:
+To publish a new version of the CLI you first need to stage the npm package. A
+helper script in `codex-cli/scripts/` does all the heavy lifting. Inside the
+`codex-cli` folder run:
 
-1. Open the `codex-cli` directory
-2. Make sure you're on a branch like `git checkout -b bump-version`
-3. Bump the version and `CLI_VERSION` to current datetime: `pnpm release:version`
-4. Commit the version bump (with DCO sign-off):
-   ```bash
-   git add codex-cli/src/utils/session.ts codex-cli/package.json
-   git commit -s -m "chore(release): codex-cli v$(node -p \"require('./codex-cli/package.json').version\")"
-   ```
-5. Copy README, build, and publish to npm: `pnpm release`
-6. Push to branch: `git push origin HEAD`
+```bash
+# Classic, JS implementation that includes small, native binaries for Linux sandboxing.
+pnpm stage-release
 
-### Alternative Build Options
+# Optionally specify the temp directory to reuse between runs.
+RELEASE_DIR=$(mktemp -d)
+pnpm stage-release --tmp "$RELEASE_DIR"
 
-#### Nix Flake Development
+# "Fat" package that additionally bundles the native Rust CLI binaries for
+# Linux. End-users can then opt-in at runtime by setting CODEX_RUST=1.
+pnpm stage-release --native
+```
+
+Go to the folder where the release is staged and verify that it works as intended. If so, run the following from the temp folder:
+
+```
+cd "$RELEASE_DIR"
+npm publish
+```
+
+### Alternative build options
+
+#### Nix flake development
 
 Prerequisite: Nix >= 2.4 with flakes enabled (`experimental-features = nix-command flakes` in `~/.config/nix/nix.conf`).
 
 Enter a Nix development shell:
 
 ```bash
-nix develop
+# Use either one of the commands according to which implementation you want to work with
+nix develop .#codex-cli # For entering codex-cli specific shell
+nix develop .#codex-rs # For entering codex-rs specific shell
 ```
 
 This shell includes Node.js, installs dependencies, builds the CLI, and provides a `codex` command alias.
@@ -554,19 +695,34 @@ This shell includes Node.js, installs dependencies, builds the CLI, and provides
 Build and run the CLI directly:
 
 ```bash
-nix build
+# Use either one of the commands according to which implementation you want to work with
+nix build .#codex-cli # For building codex-cli
+nix build .#codex-rs # For building codex-rs
 ./result/bin/codex --help
 ```
 
 Run the CLI via the flake app:
 
 ```bash
-nix run .#codex
+# Use either one of the commands according to which implementation you want to work with
+nix run .#codex-cli # For running codex-cli
+nix run .#codex-rs # For running codex-rs
+```
+
+Use direnv with flakes
+
+If you have direnv installed, you can use the following `.envrc` to automatically enter the Nix shell when you `cd` into the project directory:
+
+```bash
+cd codex-rs
+echo "use flake ../flake.nix#codex-cli" >> .envrc && direnv allow
+cd codex-cli
+echo "use flake ../flake.nix#codex-rs" >> .envrc && direnv allow
 ```
 
 ---
 
-## Security & Responsible AI
+## Security & responsible AI
 
 Have you discovered a vulnerability or have concerns about model output? Please e-mail **security@openai.com** and we will respond promptly.
 

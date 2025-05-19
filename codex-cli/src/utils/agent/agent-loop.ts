@@ -7,29 +7,44 @@ import type {
   ResponseInputItem,
   ResponseItem,
   ResponseCreateParams,
+  FunctionTool,
+  Tool,
 } from "openai/resources/responses/responses.mjs";
 import type { Reasoning } from "openai/resources.mjs";
 
-import { OPENAI_TIMEOUT_MS, getApiKey, getBaseUrl } from "../config.js";
+import { CLI_VERSION } from "../../version.js";
+import {
+  OPENAI_TIMEOUT_MS,
+  OPENAI_ORGANIZATION,
+  OPENAI_PROJECT,
+  getBaseUrl,
+  AZURE_OPENAI_API_VERSION,
+} from "../config.js";
 import { log } from "../logger/log.js";
 import { parseToolCallArguments } from "../parsers.js";
 import { responsesCreateViaChatCompletions } from "../responses.js";
 import {
   ORIGIN,
-  CLI_VERSION,
   getSessionId,
   setCurrentModel,
   setSessionId,
 } from "../session.js";
+import { applyPatchToolInstructions } from "./apply-patch.js";
 import { handleExecCommand } from "./handle-exec-command.js";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import OpenAI, { APIConnectionTimeoutError } from "openai";
+import OpenAI, { APIConnectionTimeoutError, AzureOpenAI } from "openai";
+import os from "os";
 
 // Wait time before retrying after rate limit errors (ms).
 const RATE_LIMIT_RETRY_WAIT_MS = parseInt(
-  process.env["OPENAI_RATE_LIMIT_RETRY_WAIT_MS"] || "2500",
+  process.env["OPENAI_RATE_LIMIT_RETRY_WAIT_MS"] || "500",
   10,
 );
+
+// See https://github.com/openai/openai-node/tree/v4?tab=readme-ov-file#configuring-an-https-agent-eg-for-proxies
+const PROXY_URL = process.env["HTTPS_PROXY"];
 
 export type CommandConfirmation = {
   review: ReviewDecision;
@@ -39,6 +54,7 @@ export type CommandConfirmation = {
 };
 
 const alreadyProcessedResponses = new Set();
+const alreadyStagedItemIds = new Set<string>();
 
 type AgentLoopParams = {
   model: string;
@@ -66,6 +82,35 @@ type AgentLoopParams = {
     applyPatch: ApplyPatchCommand | undefined,
   ) => Promise<CommandConfirmation>;
   onLastResponseId: (lastResponseId: string) => void;
+};
+
+const shellFunctionTool: FunctionTool = {
+  type: "function",
+  name: "shell",
+  description: "Runs a shell command, and returns its output.",
+  strict: false,
+  parameters: {
+    type: "object",
+    properties: {
+      command: { type: "array", items: { type: "string" } },
+      workdir: {
+        type: "string",
+        description: "The working directory for the command.",
+      },
+      timeout: {
+        type: "number",
+        description:
+          "The maximum time to wait for the command to complete in milliseconds.",
+      },
+    },
+    required: ["command"],
+    additionalProperties: false,
+  },
+};
+
+const localShellTool: Tool = {
+  //@ts-expect-error - waiting on sdk
+  type: "local_shell",
 };
 
 export class AgentLoop {
@@ -109,7 +154,7 @@ export class AgentLoop {
   private canceled = false;
 
   /**
-   * Local conversation transcript used when `disableResponseStorage === false`. Holds
+   * Local conversation transcript used when `disableResponseStorage === true`. Holds
    * all non‑system items exchanged so far so we can provide full context on
    * every request.
    */
@@ -247,12 +292,10 @@ export class AgentLoop {
     // defined object.  We purposefully copy over the `model` and
     // `instructions` that have already been passed explicitly so that
     // downstream consumers (e.g. telemetry) still observe the correct values.
-    this.config =
-      config ??
-      ({
-        model,
-        instructions: instructions ?? "",
-      } as AppConfig);
+    this.config = config ?? {
+      model,
+      instructions: instructions ?? "",
+    };
     this.additionalWritableRoots = additionalWritableRoots;
     this.onItem = onItem;
     this.onLoading = onLoading;
@@ -263,7 +306,7 @@ export class AgentLoop {
     this.sessionId = getSessionId() || randomUUID().replaceAll("-", "");
     // Configure OpenAI client with optional timeout (ms) from environment
     const timeoutMs = OPENAI_TIMEOUT_MS;
-    const apiKey = getApiKey(this.provider);
+    const apiKey = this.config.apiKey ?? process.env["OPENAI_API_KEY"] ?? "";
     const baseURL = getBaseUrl(this.provider);
 
     this.oai = new OpenAI({
@@ -279,9 +322,33 @@ export class AgentLoop {
         originator: ORIGIN,
         version: CLI_VERSION,
         session_id: this.sessionId,
+        ...(OPENAI_ORGANIZATION
+          ? { "OpenAI-Organization": OPENAI_ORGANIZATION }
+          : {}),
+        ...(OPENAI_PROJECT ? { "OpenAI-Project": OPENAI_PROJECT } : {}),
       },
+      httpAgent: PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : undefined,
       ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
     });
+
+    if (this.provider.toLowerCase() === "azure") {
+      this.oai = new AzureOpenAI({
+        apiKey,
+        baseURL,
+        apiVersion: AZURE_OPENAI_API_VERSION,
+        defaultHeaders: {
+          originator: ORIGIN,
+          version: CLI_VERSION,
+          session_id: this.sessionId,
+          ...(OPENAI_ORGANIZATION
+            ? { "OpenAI-Organization": OPENAI_ORGANIZATION }
+            : {}),
+          ...(OPENAI_PROJECT ? { "OpenAI-Project": OPENAI_PROJECT } : {}),
+        },
+        httpAgent: PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : undefined,
+        ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
+      });
+    }
 
     setSessionId(this.sessionId);
     setCurrentModel(this.model);
@@ -399,6 +466,73 @@ export class AgentLoop {
     return [outputItem, ...additionalItems];
   }
 
+  private async handleLocalShellCall(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    item: any,
+  ): Promise<Array<ResponseInputItem>> {
+    // If the agent has been canceled in the meantime we should not perform any
+    // additional work. Returning an empty array ensures that we neither execute
+    // the requested tool call nor enqueue any follow‑up input items. This keeps
+    // the cancellation semantics intuitive for users – once they interrupt a
+    // task no further actions related to that task should be taken.
+    if (this.canceled) {
+      return [];
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const outputItem: any = {
+      type: "local_shell_call_output",
+      // `call_id` is mandatory – ensure we never send `undefined` which would
+      // trigger the "No tool output found…" 400 from the API.
+      call_id: item.call_id,
+      output: "no function found",
+    };
+
+    // We intentionally *do not* remove this `callId` from the `pendingAborts`
+    // set right away.  The output produced below is only queued up for the
+    // *next* request to the OpenAI API – it has not been delivered yet.  If
+    // the user presses ESC‑ESC (i.e. invokes `cancel()`) in the small window
+    // between queuing the result and the actual network call, we need to be
+    // able to surface a synthetic `function_call_output` marked as
+    // "aborted".  Keeping the ID in the set until the run concludes
+    // successfully lets the next `run()` differentiate between an aborted
+    // tool call (needs the synthetic output) and a completed one (cleared
+    // below in the `flush()` helper).
+
+    // used to tell model to stop if needed
+    const additionalItems: Array<ResponseInputItem> = [];
+
+    if (item.action.type !== "exec") {
+      throw new Error("Invalid action type");
+    }
+
+    const args = {
+      cmd: item.action.command,
+      workdir: item.action.working_directory,
+      timeoutInMillis: item.action.timeout_ms,
+    };
+
+    const {
+      outputText,
+      metadata,
+      additionalItems: additionalItemsFromExec,
+    } = await handleExecCommand(
+      args,
+      this.config,
+      this.approvalPolicy,
+      this.additionalWritableRoots,
+      this.getCommandConfirmation,
+      this.execAbortController?.signal,
+    );
+    outputItem.output = JSON.stringify({ output: outputText, metadata });
+
+    if (additionalItemsFromExec) {
+      additionalItems.push(...additionalItemsFromExec);
+    }
+
+    return [outputItem, ...additionalItems];
+  }
+
   public async run(
     input: Array<ResponseInputItem>,
     previousResponseId: string = "",
@@ -442,9 +576,13 @@ export class AgentLoop {
       // `previous_response_id` when `disableResponseStorage` is enabled.  When storage
       // is disabled we deliberately ignore the caller‑supplied value because
       // the backend will not retain any state that could be referenced.
+      // If the backend stores conversation state (`disableResponseStorage === false`) we
+      // forward the caller‑supplied `previousResponseId` so that the model sees the
+      // full context.  When storage is disabled we *must not* send any ID because the
+      // server no longer retains the referenced response.
       let lastResponseId: string = this.disableResponseStorage
-        ? previousResponseId
-        : "";
+        ? ""
+        : previousResponseId;
 
       // If there are unresolved function calls from a previously cancelled run
       // we have to emit dummy tool outputs so that the API no longer expects
@@ -473,7 +611,16 @@ export class AgentLoop {
       // conversation, so we must include the *entire* transcript (minus system
       // messages) on every call.
 
-      let turnInput: Array<ResponseInputItem>;
+      let turnInput: Array<ResponseInputItem> = [];
+      // Keeps track of how many items in `turnInput` stem from the existing
+      // transcript so we can avoid re‑emitting them to the UI. Only used when
+      // `disableResponseStorage === true`.
+      let transcriptPrefixLen = 0;
+
+      let tools: Array<Tool> = [shellFunctionTool];
+      if (this.model.startsWith("codex")) {
+        tools = [localShellTool];
+      }
 
       const stripInternalFields = (
         item: ResponseInputItem,
@@ -485,22 +632,25 @@ export class AgentLoop {
         // be referenced elsewhere (e.g. UI components).
         const clean = { ...item } as Record<string, unknown>;
         delete clean["duration_ms"];
+        // Remove OpenAI-assigned identifiers and transient status so the
+        // backend does not reject items that were never persisted because we
+        // use `store: false`.
+        delete clean["id"];
+        delete clean["status"];
         return clean as unknown as ResponseInputItem;
       };
 
       if (this.disableResponseStorage) {
+        // Remember where the existing transcript ends – everything after this
+        // index in the upcoming `turnInput` list will be *new* for this turn
+        // and therefore needs to be surfaced to the UI.
+        transcriptPrefixLen = this.transcript.length;
+
         // Ensure the transcript is up‑to‑date with the latest user input so
         // that subsequent iterations see a complete history.
-        const newUserItems: Array<ResponseInputItem> = input.filter((it) => {
-          if (
-            (it.type === "message" && it.role !== "system") ||
-            it.type === "reasoning"
-          ) {
-            return false;
-          }
-          return true;
-        });
-        this.transcript.push(...newUserItems);
+        // `turnInput` is still empty at this point (it will be filled later).
+        // We need to look at the *input* items the user just supplied.
+        this.transcript.push(...filterToApiMessages(input));
 
         turnInput = [...this.transcript, ...abortOutputs].map(
           stripInternalFields,
@@ -518,17 +668,27 @@ export class AgentLoop {
           return;
         }
 
+        // Skip items we've already processed to avoid staging duplicates
+        if (item.id && alreadyStagedItemIds.has(item.id)) {
+          return;
+        }
+        alreadyStagedItemIds.add(item.id);
+
         // Store the item so the final flush can still operate on a complete list.
         // We'll nil out entries once they're delivered.
         const idx = staged.push(item) - 1;
 
         // Instead of emitting synchronously we schedule a short‑delay delivery.
+        //
         // This accomplishes two things:
         //   1. The UI still sees new messages almost immediately, creating the
         //      perception of real‑time updates.
         //   2. If the user calls `cancel()` in the small window right after the
         //      item was staged we can still abort the delivery because the
         //      generation counter will have been bumped by `cancel()`.
+        //
+        // Use a minimal 3ms delay for terminal rendering to maintain readable
+        // streaming.
         setTimeout(() => {
           if (
             thisGeneration === this.generation &&
@@ -539,8 +699,9 @@ export class AgentLoop {
             // Mark as delivered so flush won't re-emit it
             staged[idx] = undefined;
 
-            // When we operate without server‑side storage we keep our own
-            // transcript so we can provide full context on subsequent calls.
+            // Handle transcript updates to maintain consistency. When we
+            // operate without server‑side storage we keep our own transcript
+            // so we can provide full context on subsequent calls.
             if (this.disableResponseStorage) {
               // Exclude system messages from transcript as they do not form
               // part of the assistant/user dialogue that the model needs.
@@ -552,6 +713,26 @@ export class AgentLoop {
                 // such as `duration_ms` which is not part of the Responses
                 // API schema and therefore causes a 400 error when included
                 // in subsequent requests whose context is sent verbatim.
+
+                // Skip items that we have already inserted earlier or that the
+                // model does not need to see again in the next turn.
+                //   • function_call   – superseded by the forthcoming
+                //     function_call_output.
+                //   • reasoning       – internal only, never sent back.
+                //   • user messages   – we added these to the transcript when
+                //     building the first turnInput; stageItem would add a
+                //     duplicate.
+                if (
+                  (item as ResponseInputItem).type === "function_call" ||
+                  (item as ResponseInputItem).type === "reasoning" ||
+                  //@ts-expect-error - waiting on sdk
+                  (item as ResponseInputItem).type === "local_shell_call" ||
+                  ((item as ResponseInputItem).type === "message" &&
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    (item as any).role === "user")
+                ) {
+                  return;
+                }
 
                 const clone: ResponseInputItem = {
                   ...(item as unknown as ResponseInputItem),
@@ -566,7 +747,7 @@ export class AgentLoop {
               }
             }
           }
-        }, 10);
+        }, 3); // Small 3ms delay for readable streaming.
       };
 
       while (turnInput.length > 0) {
@@ -578,25 +759,42 @@ export class AgentLoop {
         // Only surface the *new* input items to the UI – replaying the entire
         // transcript would duplicate messages that have already been shown in
         // earlier turns.
-        const deltaInput = [...abortOutputs, ...input];
+        // `turnInput` holds the *new* items that will be sent to the API in
+        // this iteration.  Surface exactly these to the UI so that we do not
+        // re‑emit messages from previous turns (which would duplicate user
+        // prompts) and so that freshly generated `function_call_output`s are
+        // shown immediately.
+        // Figure out what subset of `turnInput` constitutes *new* information
+        // for the UI so that we don't spam the interface with repeats of the
+        // entire transcript on every iteration when response storage is
+        // disabled.
+        const deltaInput = this.disableResponseStorage
+          ? turnInput.slice(transcriptPrefixLen)
+          : [...turnInput];
         for (const item of deltaInput) {
           stageItem(item as ResponseItem);
         }
-        // Send request to OpenAI with retry on timeout
+        // Send request to OpenAI with retry on timeout.
         let stream;
 
         // Retry loop for transient errors. Up to MAX_RETRIES attempts.
-        const MAX_RETRIES = 5;
+        const MAX_RETRIES = 8;
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
           try {
             let reasoning: Reasoning | undefined;
-            if (this.model.startsWith("o")) {
-              reasoning = { effort: "high" };
-              if (this.model === "o3" || this.model === "o4-mini") {
-                reasoning.summary = "auto";
-              }
+            let modelSpecificInstructions: string | undefined;
+            if (this.model.startsWith("o") || this.model.startsWith("codex")) {
+              reasoning = { effort: this.config.reasoningEffort ?? "medium" };
+              reasoning.summary = "auto";
             }
-            const mergedInstructions = [prefix, this.instructions]
+            if (this.model.startsWith("gpt-4.1")) {
+              modelSpecificInstructions = applyPatchToolInstructions;
+            }
+            const mergedInstructions = [
+              prefix,
+              modelSpecificInstructions,
+              this.instructions,
+            ]
               .filter(Boolean)
               .join("\n");
 
@@ -629,31 +827,12 @@ export class AgentLoop {
                     store: true,
                     previous_response_id: lastResponseId || undefined,
                   }),
-              tools: [
-                {
-                  type: "function",
-                  name: "shell",
-                  description: "Runs a shell command, and returns its output.",
-                  strict: true,
-                  parameters: {
-                    type: "object",
-                    properties: {
-                      command: { type: "array", items: { type: "string" } },
-                      workdir: {
-                        type: "string",
-                        description: "The working directory for the command.",
-                      },
-                      timeout: {
-                        type: "number",
-                        description:
-                          "The maximum time to wait for the command to complete in milliseconds.",
-                      },
-                    },
-                    required: ["command", "workdir", "timeout"],
-                    additionalProperties: false,
-                  },
-                },
-              ],
+              tools: tools,
+              // Explicitly tell the model it is allowed to pick whatever
+              // tool it deems appropriate.  Omitting this sometimes leads to
+              // the model ignoring the available tools and responding with
+              // plain text instead (resulting in a missing tool‑call).
+              tool_choice: "auto",
             });
             break;
           } catch (error) {
@@ -673,7 +852,13 @@ export class AgentLoop {
             const errCtx = error as any;
             const status =
               errCtx?.status ?? errCtx?.httpStatus ?? errCtx?.statusCode;
-            const isServerError = typeof status === "number" && status >= 500;
+            // Treat classical 5xx *and* explicit OpenAI `server_error` types
+            // as transient server-side failures that qualify for a retry. The
+            // SDK often omits the numeric status for these, reporting only
+            // the `type` field.
+            const isServerError =
+              (typeof status === "number" && status >= 500) ||
+              errCtx?.type === "server_error";
             if (
               (isTimeout || isServerError || isConnectionError) &&
               attempt < MAX_RETRIES
@@ -815,7 +1000,6 @@ export class AgentLoop {
             throw error;
           }
         }
-        turnInput = []; // clear turn input, prepare for function call results
 
         // If the user requested cancellation while we were awaiting the network
         // request, abort immediately before we start handling the stream.
@@ -835,7 +1019,7 @@ export class AgentLoop {
         // Keep track of the active stream so it can be aborted on demand.
         this.currentStream = stream;
 
-        // guard against an undefined stream before iterating
+        // Guard against an undefined stream before iterating.
         if (!stream) {
           this.onLoading(false);
           log("AgentLoop.run(): stream is undefined");
@@ -848,6 +1032,8 @@ export class AgentLoop {
         // eslint-disable-next-line no-constant-condition
         while (true) {
           try {
+            let newTurnInput: Array<ResponseInputItem> = [];
+
             // eslint-disable-next-line no-await-in-loop
             for await (const event of stream as AsyncIterable<ResponseEvent>) {
               log(`AgentLoop.run(): response event ${event.type}`);
@@ -861,7 +1047,10 @@ export class AgentLoop {
                 if (maybeReasoning.type === "reasoning") {
                   maybeReasoning.duration_ms = Date.now() - thinkingStart;
                 }
-                if (item.type === "function_call") {
+                if (
+                  item.type === "function_call" ||
+                  item.type === "local_shell_call"
+                ) {
                   // Track outstanding tool call so we can abort later if needed.
                   // The item comes from the streaming response, therefore it has
                   // either `id` (chat) or `call_id` (responses) – we normalise
@@ -883,18 +1072,71 @@ export class AgentLoop {
                     stageItem(item as ResponseItem);
                   }
                 }
-                if (event.response.status === "completed") {
+                if (
+                  event.response.status === "completed" ||
+                  (event.response.status as unknown as string) ===
+                    "requires_action"
+                ) {
                   // TODO: remove this once we can depend on streaming events
-                  const newTurnInput = await this.processEventsWithoutStreaming(
+                  newTurnInput = await this.processEventsWithoutStreaming(
                     event.response.output,
                     stageItem,
                   );
-                  turnInput = newTurnInput;
+
+                  // When we do not use server‑side storage we maintain our
+                  // own transcript so that *future* turns still contain full
+                  // conversational context. However, whether we advance to
+                  // another loop iteration should depend solely on the
+                  // presence of *new* input items (i.e. items that were not
+                  // part of the previous request). Re‑sending the transcript
+                  // by itself would create an infinite request loop because
+                  // `turnInput.length` would never reach zero.
+
+                  if (this.disableResponseStorage) {
+                    // 1) Append the freshly emitted output to our local
+                    //    transcript (minus non‑message items the model does
+                    //    not need to see again).
+                    const cleaned = filterToApiMessages(
+                      event.response.output.map(stripInternalFields),
+                    );
+                    this.transcript.push(...cleaned);
+
+                    // 2) Determine the *delta* (newTurnInput) that must be
+                    //    sent in the next iteration. If there is none we can
+                    //    safely terminate the loop – the transcript alone
+                    //    does not constitute new information for the
+                    //    assistant to act upon.
+
+                    const delta = filterToApiMessages(
+                      newTurnInput.map(stripInternalFields),
+                    );
+
+                    if (delta.length === 0) {
+                      // No new input => end conversation.
+                      newTurnInput = [];
+                    } else {
+                      // Re‑send full transcript *plus* the new delta so the
+                      // stateless backend receives complete context.
+                      newTurnInput = [...this.transcript, ...delta];
+                      // The prefix ends at the current transcript length –
+                      // everything after this index is new for the next
+                      // iteration.
+                      transcriptPrefixLen = this.transcript.length;
+                    }
+                  }
                 }
                 lastResponseId = event.response.id;
                 this.onLastResponseId(event.response.id);
               }
             }
+
+            // Set after we have consumed all stream events in case the stream wasn't
+            // complete or we missed events for whatever reason. That way, we will set
+            // the next turn to an empty array to prevent an infinite loop.
+            // And don't update the turn input too early otherwise we won't have the
+            // current turn inputs available for retries.
+            turnInput = newTurnInput;
+
             // Stream finished successfully – leave the retry loop.
             break;
           } catch (err: unknown) {
@@ -931,7 +1173,11 @@ export class AgentLoop {
               let reasoning: Reasoning | undefined;
               if (this.model.startsWith("o")) {
                 reasoning = { effort: "high" };
-                if (this.model === "o3" || this.model === "o4-mini") {
+                if (
+                  this.model === "o3" ||
+                  this.model === "o4-mini" ||
+                  this.model === "codex-mini-latest"
+                ) {
                   reasoning.summary = "auto";
                 }
               }
@@ -951,45 +1197,27 @@ export class AgentLoop {
                         params as ResponseCreateParams & { stream: true },
                       );
 
+              log(
+                "agentLoop.run(): responseCall(1): turnInput: " +
+                  JSON.stringify(turnInput),
+              );
               // eslint-disable-next-line no-await-in-loop
               stream = await responseCall({
                 model: this.model,
                 instructions: mergedInstructions,
-                previous_response_id: lastResponseId || undefined,
                 input: turnInput,
                 stream: true,
                 parallel_tool_calls: false,
                 reasoning,
                 ...(this.config.flexMode ? { service_tier: "flex" } : {}),
-                tools: [
-                  {
-                    type: "function",
-                    name: "shell",
-                    description:
-                      "Runs a shell command, and returns its output.",
-                    strict: false,
-                    parameters: {
-                      type: "object",
-                      properties: {
-                        command: {
-                          type: "array",
-                          items: { type: "string" },
-                        },
-                        workdir: {
-                          type: "string",
-                          description: "The working directory for the command.",
-                        },
-                        timeout: {
-                          type: "number",
-                          description:
-                            "The maximum time to wait for the command to complete in milliseconds.",
-                        },
-                      },
-                      required: ["command"],
-                      additionalProperties: false,
-                    },
-                  },
-                ],
+                ...(this.disableResponseStorage
+                  ? { store: false }
+                  : {
+                      store: true,
+                      previous_response_id: lastResponseId || undefined,
+                    }),
+                tools: tools,
+                tool_choice: "auto",
               });
 
               this.currentStream = stream;
@@ -1035,7 +1263,7 @@ export class AgentLoop {
                 content: [
                   {
                     type: "input_text",
-                    text: "⚠️ Insufficient quota. Please check your billing details and retry.",
+                    text: `\u26a0 Insufficient quota: ${err instanceof Error && err.message ? err.message.trim() : "No remaining quota."} Manage or purchase credits at https://platform.openai.com/account/billing.`,
                   },
                 ],
               });
@@ -1116,8 +1344,18 @@ export class AgentLoop {
         this.onLoading(false);
       };
 
-      // Delay flush slightly to allow a near‑simultaneous cancel() to land.
-      setTimeout(flush, 30);
+      // Use a small delay to make sure UI rendering is smooth. Double-check
+      // cancellation state right before flushing to avoid race conditions.
+      setTimeout(() => {
+        if (
+          !this.canceled &&
+          !this.hardAbort.signal.aborted &&
+          thisGeneration === this.generation
+        ) {
+          flush();
+        }
+      }, 3);
+
       // End of main logic. The corresponding catch block for the wrapper at the
       // start of this method follows next.
     } catch (err) {
@@ -1340,6 +1578,17 @@ export class AgentLoop {
         // eslint-disable-next-line no-await-in-loop
         const result = await this.handleFunctionCall(item);
         turnInput.push(...result);
+        //@ts-expect-error - waiting on sdk
+      } else if (item.type === "local_shell_call") {
+        //@ts-expect-error - waiting on sdk
+        if (alreadyProcessedResponses.has(item.id)) {
+          continue;
+        }
+        //@ts-expect-error - waiting on sdk
+        alreadyProcessedResponses.add(item.id);
+        // eslint-disable-next-line no-await-in-loop
+        const result = await this.handleLocalShellCall(item);
+        turnInput.push(...result);
       }
       emitItem(item as ResponseItem);
     }
@@ -1347,6 +1596,19 @@ export class AgentLoop {
   }
 }
 
+// Dynamic developer message prefix: includes user, workdir, and rg suggestion.
+const userName = os.userInfo().username;
+const workdir = process.cwd();
+const dynamicLines: Array<string> = [
+  `User: ${userName}`,
+  `Workdir: ${workdir}`,
+];
+if (spawnSync("rg", ["--version"], { stdio: "ignore" }).status === 0) {
+  dynamicLines.push(
+    "- Always use rg instead of grep/ls -R because it is much faster and respects gitignore",
+  );
+}
+const dynamicPrefix = dynamicLines.join("\n");
 const prefix = `You are operating as and within the Codex CLI, a terminal-based agentic coding assistant built by OpenAI. It wraps OpenAI models to enable natural language interaction with a local codebase. You are expected to be precise, safe, and helpful.
 
 You can:
@@ -1382,14 +1644,29 @@ You MUST adhere to the following criteria when executing the task:
         - If there is a .pre-commit-config.yaml, use \`pre-commit run --files ...\` to check that your changes pass the pre-commit checks. However, do not fix pre-existing errors on lines you didn't touch.
             - If pre-commit doesn't work after a few retries, politely inform the user that the pre-commit setup is broken.
         - Once you finish coding, you must
-            - Check \`git status\` to sanity check your changes; revert any scratch files or changes.
             - Remove all inline comments you added as much as possible, even if they look normal. Check using \`git diff\`. Inline comments must be generally avoided, unless active maintainers of the repo, after long careful study of the code and the issue, will still misinterpret the code without the comments.
             - Check if you accidentally add copyright or license headers. If so, remove them.
             - Try to run pre-commit if it is available.
             - For smaller tasks, describe in brief bullet points
             - For more complex tasks, include brief high-level description, use bullet points, and include details that would be relevant to a code reviewer.
 - If completing the user's task DOES NOT require writing or modifying files (e.g., the user asks a question about the code base):
-    - Respond in a friendly tune as a remote teammate, who is knowledgeable, capable and eager to help with coding.
+    - Respond in a friendly tone as a remote teammate, who is knowledgeable, capable and eager to help with coding.
 - When your task involves writing or modifying files:
     - Do NOT tell the user to "save the file" or "copy the code into a file" if you already created or modified the file using \`apply_patch\`. Instead, reference the file as already saved.
-    - Do NOT show the full contents of large files you have already written, unless the user explicitly asks for them.`;
+    - Do NOT show the full contents of large files you have already written, unless the user explicitly asks for them.
+
+${dynamicPrefix}`;
+
+function filterToApiMessages(
+  items: Array<ResponseInputItem>,
+): Array<ResponseInputItem> {
+  return items.filter((it) => {
+    if (it.type === "message" && it.role === "system") {
+      return false;
+    }
+    if (it.type === "reasoning") {
+      return false;
+    }
+    return true;
+  });
+}

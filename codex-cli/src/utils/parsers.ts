@@ -35,6 +35,7 @@ export function parseToolCallOutput(toolCallOutput: string): {
 export type CommandReviewDetails = {
   cmd: Array<string>;
   cmdReadableText: string;
+  workdir: string | undefined;
 };
 
 /**
@@ -51,12 +52,13 @@ export function parseToolCall(
     return undefined;
   }
 
-  const { cmd } = toolCallArgs;
+  const { cmd, workdir } = toolCallArgs;
   const cmdReadableText = formatCommandForDisplay(cmd);
 
   return {
     cmd,
     cmdReadableText,
+    workdir,
   };
 }
 
@@ -81,7 +83,13 @@ export function parseToolCallArguments(
   }
 
   const { cmd, command } = json as Record<string, unknown>;
-  const commandArray = toStringArray(cmd) ?? toStringArray(command);
+  // The OpenAI model sometimes produces a single string instead of an array.
+  // Accept both shapes:
+  const commandArray =
+    toStringArray(cmd) ??
+    toStringArray(command) ??
+    (typeof cmd === "string" ? [cmd] : undefined) ??
+    (typeof command === "string" ? [command] : undefined);
   if (commandArray == null) {
     return undefined;
   }

@@ -74,7 +74,7 @@ vi.mock("openai", () => {
 vi.mock("../src/approvals.js", () => ({
   __esModule: true,
   alwaysApprovedCommands: new Set<string>(),
-  canAutoApprove: () => ({ type: "auto-approve", runInSandbox: false } as any),
+  canAutoApprove: () => ({ type: "auto-approve", runInSandbox: false }) as any,
 }));
 
 vi.mock("../src/format-command.js", () => ({
@@ -102,7 +102,7 @@ describe("cancel clears previous_response_id", () => {
       additionalWritableRoots: [],
       onItem: () => {},
       onLoading: () => {},
-      getCommandConfirmation: async () => ({ review: "yes" } as any),
+      getCommandConfirmation: async () => ({ review: "yes" }) as any,
       onLastResponseId: () => {},
       config: { model: "any", instructions: "", notify: false },
     });
@@ -132,8 +132,6 @@ describe("cancel clears previous_response_id", () => {
     ] as any);
 
     const bodies = _test.getBodies();
-    // eslint-disable-next-line no-console
-    console.log(JSON.stringify(bodies, null, 2));
     expect(bodies.length).toBeGreaterThanOrEqual(2);
 
     // The *last* invocation belongs to the second run (after cancellation).

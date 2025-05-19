@@ -1,8 +1,9 @@
 import type { ResponseItem } from "openai/resources/responses/responses.mjs";
 
 import { approximateTokensUsed } from "./approximate-tokens-used.js";
-import { getBaseUrl, getApiKey } from "./config";
-import OpenAI from "openai";
+import { getApiKey } from "./config.js";
+import { type SupportedModelId, openAiModelInfo } from "./model-info.js";
+import { createOpenAIClient } from "./openai-client.js";
 
 const MODEL_LIST_TIMEOUT_MS = 2_000; // 2 seconds
 export const RECOMMENDED_MODELS: Array<string> = ["o4-mini", "o3"];
@@ -21,10 +22,7 @@ async function fetchModels(provider: string): Promise<Array<string>> {
   }
 
   try {
-    const openai = new OpenAI({
-      apiKey: getApiKey(provider),
-      baseURL: getBaseUrl(provider),
-    });
+    const openai = createOpenAIClient({ provider });
     const list = await openai.models.list();
     const models: Array<string> = [];
     for await (const model of list as AsyncIterable<{ id?: string }>) {
@@ -89,10 +87,12 @@ export async function isModelSupportedForResponses(
 }
 
 /** Returns the maximum context length (in tokens) for a given model. */
-function maxTokensForModel(model: string): number {
-  // TODO: These numbers are best‑effort guesses and provide a basis for UI percentages. They
-  // should be provider & model specific instead of being wild guesses.
+export function maxTokensForModel(model: string): number {
+  if (model in openAiModelInfo) {
+    return openAiModelInfo[model as SupportedModelId].maxContextLength;
+  }
 
+  // fallback to heuristics for models not in the registry
   const lower = model.toLowerCase();
   if (lower.includes("32k")) {
     return 32000;
